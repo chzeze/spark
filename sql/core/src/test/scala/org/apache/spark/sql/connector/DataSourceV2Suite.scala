@@ -30,6 +30,7 @@ import org.apache.spark.sql.{AnalysisException, DataFrame, QueryTest, Row}
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.connector.catalog.{SupportsRead, Table, TableCapability, TableProvider}
 import org.apache.spark.sql.connector.catalog.TableCapability._
+import org.apache.spark.sql.connector.expressions.Transform
 import org.apache.spark.sql.connector.read._
 import org.apache.spark.sql.connector.read.partitioning.{ClusteredDistribution, Distribution, Partitioning}
 import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanHelper
@@ -156,6 +157,19 @@ class DataSourceV2Suite extends QueryTest with SharedSparkSession with AdaptiveS
     }
   }
 
+  test("SPARK-33369: Skip schema inference in DataframeWriter.save() if table provider " +
+    "supports external metadata") {
+    withTempDir { dir =>
+      val cls = classOf[SupportsExternalMetadataWritableDataSource].getName
+      spark.range(10).select('id as 'i, -'id as 'j).write.format(cls)
+          .option("path", dir.getCanonicalPath).mode("append").save()
+      val schema = new StructType().add("i", "long").add("j", "long")
+        checkAnswer(
+          spark.read.format(cls).option("path", dir.getCanonicalPath).schema(schema).load(),
+          spark.range(10).select('id, -'id))
+    }
+  }
+
   test("partitioning reporting") {
     import org.apache.spark.sql.functions.{count, sum}
     Seq(classOf[PartitionAwareDataSource], classOf[JavaPartitionAwareDataSource]).foreach { cls =>
@@ -267,7 +281,7 @@ class DataSourceV2Suite extends QueryTest with SharedSparkSession with AdaptiveS
           }
         }
         // this input data will fail to read middle way.
-        val input = spark.range(10).select(failingUdf('id).as('i)).select('i, -'i as 'j)
+        val input = spark.range(15).select(failingUdf('id).as('i)).select('i, -'i as 'j)
         val e3 = intercept[SparkException] {
           input.write.format(cls.getName).option("path", path).mode("overwrite").save()
         }
@@ -393,6 +407,35 @@ class DataSourceV2Suite extends QueryTest with SharedSparkSession with AdaptiveS
       checkAnswer(df, (0 until 3).map(i => Row(i)))
     }
   }
+
+  test("SPARK-32609: DataSourceV2 with different pushedfilters should be different") {
+    def getScanExec(query: DataFrame): BatchScanExec = {
+      query.queryExecution.executedPlan.collect {
+        case d: BatchScanExec => d
+      }.head
+    }
+
+    Seq(classOf[AdvancedDataSourceV2], classOf[JavaAdvancedDataSourceV2]).foreach { cls =>
+      withClue(cls.getName) {
+        val df = spark.read.format(cls.getName).load()
+        val q1 = df.select('i).filter('i > 6)
+        val q2 = df.select('i).filter('i > 5)
+        val scan1 = getScanExec(q1)
+        val scan2 = getScanExec(q2)
+        assert(!scan1.equals(scan2))
+      }
+    }
+  }
+
+  test("SPARK-33267: push down with condition 'in (..., null)' should not throw NPE") {
+    Seq(classOf[AdvancedDataSourceV2], classOf[JavaAdvancedDataSourceV2]).foreach { cls =>
+      withClue(cls.getName) {
+        val df = spark.read.format(cls.getName).load()
+        // before SPARK-33267 below query just threw NPE
+        df.select('i).where("i in (1, null)").collect()
+      }
+    }
+  }
 }
 
 
@@ -418,7 +461,7 @@ object SimpleReaderFactory extends PartitionReaderFactory {
 
 abstract class SimpleBatchTable extends Table with SupportsRead  {
 
-  override def schema(): StructType = new StructType().add("i", "int").add("j", "int")
+  override def schema(): StructType = TestingV2Source.schema
 
   override def name(): String = this.getClass.toString
 
@@ -432,12 +475,31 @@ abstract class SimpleScanBuilder extends ScanBuilder
 
   override def toBatch: Batch = this
 
-  override def readSchema(): StructType = new StructType().add("i", "int").add("j", "int")
+  override def readSchema(): StructType = TestingV2Source.schema
 
   override def createReaderFactory(): PartitionReaderFactory = SimpleReaderFactory
 }
 
-class SimpleSinglePartitionSource extends TableProvider {
+trait TestingV2Source extends TableProvider {
+  override def inferSchema(options: CaseInsensitiveStringMap): StructType = {
+    TestingV2Source.schema
+  }
+
+  override def getTable(
+      schema: StructType,
+      partitioning: Array[Transform],
+      properties: util.Map[String, String]): Table = {
+    getTable(new CaseInsensitiveStringMap(properties))
+  }
+
+  def getTable(options: CaseInsensitiveStringMap): Table
+}
+
+object TestingV2Source {
+  val schema = new StructType().add("i", "int").add("j", "int")
+}
+
+class SimpleSinglePartitionSource extends TestingV2Source {
 
   class MyScanBuilder extends SimpleScanBuilder {
     override def planInputPartitions(): Array[InputPartition] = {
@@ -452,9 +514,10 @@ class SimpleSinglePartitionSource extends TableProvider {
   }
 }
 
+
 // This class is used by pyspark tests. If this class is modified/moved, make sure pyspark
 // tests still pass.
-class SimpleDataSourceV2 extends TableProvider {
+class SimpleDataSourceV2 extends TestingV2Source {
 
   class MyScanBuilder extends SimpleScanBuilder {
     override def planInputPartitions(): Array[InputPartition] = {
@@ -469,7 +532,7 @@ class SimpleDataSourceV2 extends TableProvider {
   }
 }
 
-class AdvancedDataSourceV2 extends TableProvider {
+class AdvancedDataSourceV2 extends TestingV2Source {
 
   override def getTable(options: CaseInsensitiveStringMap): Table = new SimpleBatchTable {
     override def newScanBuilder(options: CaseInsensitiveStringMap): ScanBuilder = {
@@ -481,7 +544,7 @@ class AdvancedDataSourceV2 extends TableProvider {
 class AdvancedScanBuilder extends ScanBuilder
   with Scan with SupportsPushDownFilters with SupportsPushDownRequiredColumns {
 
-  var requiredSchema = new StructType().add("i", "int").add("j", "int")
+  var requiredSchema = TestingV2Source.schema
   var filters = Array.empty[Filter]
 
   override def pruneColumns(requiredSchema: StructType): Unit = {
@@ -567,11 +630,16 @@ class SchemaRequiredDataSource extends TableProvider {
     override def readSchema(): StructType = schema
   }
 
-  override def getTable(options: CaseInsensitiveStringMap): Table = {
+  override def supportsExternalMetadata(): Boolean = true
+
+  override def inferSchema(options: CaseInsensitiveStringMap): StructType = {
     throw new IllegalArgumentException("requires a user-supplied schema")
   }
 
-  override def getTable(options: CaseInsensitiveStringMap, schema: StructType): Table = {
+  override def getTable(
+      schema: StructType,
+      partitioning: Array[Transform],
+      properties: util.Map[String, String]): Table = {
     val userGivenSchema = schema
     new SimpleBatchTable {
       override def schema(): StructType = userGivenSchema
@@ -583,7 +651,7 @@ class SchemaRequiredDataSource extends TableProvider {
   }
 }
 
-class ColumnarDataSourceV2 extends TableProvider {
+class ColumnarDataSourceV2 extends TestingV2Source {
 
   class MyScanBuilder extends SimpleScanBuilder {
 
@@ -648,7 +716,7 @@ object ColumnarReaderFactory extends PartitionReaderFactory {
   }
 }
 
-class PartitionAwareDataSource extends TableProvider {
+class PartitionAwareDataSource extends TestingV2Source {
 
   class MyScanBuilder extends SimpleScanBuilder
     with SupportsReportPartitioning{
@@ -716,7 +784,17 @@ class SimpleWriteOnlyDataSource extends SimpleWritableDataSource {
   }
 }
 
-class ReportStatisticsDataSource extends TableProvider {
+class SupportsExternalMetadataWritableDataSource extends SimpleWritableDataSource {
+  override def supportsExternalMetadata(): Boolean = true
+
+  override def inferSchema(options: CaseInsensitiveStringMap): StructType = {
+    throw new IllegalArgumentException(
+      "Dataframe writer should not require inferring table schema the data source supports" +
+        " external metadata.")
+  }
+}
+
+class ReportStatisticsDataSource extends SimpleWritableDataSource {
 
   class MyScanBuilder extends SimpleScanBuilder
     with SupportsReportStatistics {

@@ -21,6 +21,7 @@ import java.nio.charset.StandardCharsets
 
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.functions.{log => logarithm}
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SharedSparkSession
 
 private object MathFunctionsTestData {
@@ -124,6 +125,11 @@ class MathFunctionsSuite extends QueryTest with SharedSparkSession {
     testOneToOneMathFunction(sinh, math.sinh)
   }
 
+  test("asinh") {
+    testOneToOneMathFunction(asinh,
+      (x: Double) => math.log(x + math.sqrt(x * x + 1)) )
+  }
+
   test("cos") {
     testOneToOneMathFunction(cos, math.cos)
   }
@@ -136,6 +142,11 @@ class MathFunctionsSuite extends QueryTest with SharedSparkSession {
     testOneToOneMathFunction(cosh, math.cosh)
   }
 
+  test("acosh") {
+    testOneToOneMathFunction(acosh,
+      (x: Double) => math.log(x + math.sqrt(x * x - 1)) )
+  }
+
   test("tan") {
     testOneToOneMathFunction(tan, math.tan)
   }
@@ -146,6 +157,11 @@ class MathFunctionsSuite extends QueryTest with SharedSparkSession {
 
   test("tanh") {
     testOneToOneMathFunction(tanh, math.tanh)
+  }
+
+  test("atanh") {
+    testOneToOneMathFunction(atanh,
+      (x: Double) => (0.5 * (math.log1p(x) - math.log1p(-x))) )
   }
 
   test("degrees") {
@@ -184,7 +200,7 @@ class MathFunctionsSuite extends QueryTest with SharedSparkSession {
     checkAnswer(df.selectExpr("""conv("100", 2, 10)"""), Row("4"))
     checkAnswer(df.selectExpr("""conv("-10", 16, -10)"""), Row("-16"))
     checkAnswer(
-      df.selectExpr("""conv("9223372036854775807", 36, -16)"""), Row("-1")) // for overflow
+      df.selectExpr("""conv("9223372036854775807", 36, -16)"""), Row("12DDAC15F246BAF8C0D551AC7"))
   }
 
   test("floor") {
@@ -218,19 +234,21 @@ class MathFunctionsSuite extends QueryTest with SharedSparkSession {
       Seq(Row(5, 0, 0), Row(55, 60, 100), Row(555, 560, 600))
     )
 
-    val pi = "3.1415"
-    checkAnswer(
-      sql(s"SELECT round($pi, -3), round($pi, -2), round($pi, -1), " +
-        s"round($pi, 0), round($pi, 1), round($pi, 2), round($pi, 3)"),
-      Seq(Row(BigDecimal("0E3"), BigDecimal("0E2"), BigDecimal("0E1"), BigDecimal(3),
-        BigDecimal("3.1"), BigDecimal("3.14"), BigDecimal("3.142")))
-    )
-    checkAnswer(
-      sql(s"SELECT bround($pi, -3), bround($pi, -2), bround($pi, -1), " +
-        s"bround($pi, 0), bround($pi, 1), bround($pi, 2), bround($pi, 3)"),
-      Seq(Row(BigDecimal("0E3"), BigDecimal("0E2"), BigDecimal("0E1"), BigDecimal(3),
-        BigDecimal("3.1"), BigDecimal("3.14"), BigDecimal("3.142")))
-    )
+    withSQLConf(SQLConf.LEGACY_ALLOW_NEGATIVE_SCALE_OF_DECIMAL_ENABLED.key -> "true") {
+      val pi = "3.1415"
+      checkAnswer(
+        sql(s"SELECT round($pi, -3), round($pi, -2), round($pi, -1), " +
+          s"round($pi, 0), round($pi, 1), round($pi, 2), round($pi, 3)"),
+        Seq(Row(BigDecimal("0E3"), BigDecimal("0E2"), BigDecimal("0E1"), BigDecimal(3),
+          BigDecimal("3.1"), BigDecimal("3.14"), BigDecimal("3.142")))
+      )
+      checkAnswer(
+        sql(s"SELECT bround($pi, -3), bround($pi, -2), bround($pi, -1), " +
+          s"bround($pi, 0), bround($pi, 1), bround($pi, 2), bround($pi, 3)"),
+        Seq(Row(BigDecimal("0E3"), BigDecimal("0E2"), BigDecimal("0E1"), BigDecimal(3),
+          BigDecimal("3.1"), BigDecimal("3.14"), BigDecimal("3.142")))
+      )
+    }
 
     val bdPi: BigDecimal = BigDecimal(31415925L, 7)
     checkAnswer(

@@ -21,13 +21,11 @@ import scala.collection.JavaConverters._
 import scala.collection.mutable
 
 import org.apache.spark.annotation.Experimental
-import org.apache.spark.sql.catalyst.analysis.{CannotReplaceMissingTableException, NoSuchTableException, TableAlreadyExistsException}
+import org.apache.spark.sql.catalyst.analysis.{CannotReplaceMissingTableException, NoSuchTableException, TableAlreadyExistsException, UnresolvedRelation}
 import org.apache.spark.sql.catalyst.expressions.{Attribute, Bucket, Days, Hours, Literal, Months, Years}
-import org.apache.spark.sql.catalyst.plans.logical.{AppendData, CreateTableAsSelect, LogicalPlan, OverwriteByExpression, OverwritePartitionsDynamic, ReplaceTableAsSelect}
-import org.apache.spark.sql.connector.catalog.TableCatalog
+import org.apache.spark.sql.catalyst.plans.logical.{AppendData, CreateTableAsSelectStatement, LogicalPlan, OverwriteByExpression, OverwritePartitionsDynamic, ReplaceTableAsSelectStatement}
 import org.apache.spark.sql.connector.expressions.{LogicalExpressions, NamedReference, Transform}
 import org.apache.spark.sql.execution.SQLExecution
-import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
 import org.apache.spark.sql.types.IntegerType
 
 /**
@@ -39,22 +37,11 @@ import org.apache.spark.sql.types.IntegerType
 final class DataFrameWriterV2[T] private[sql](table: String, ds: Dataset[T])
     extends CreateTableWriter[T] {
 
-  import org.apache.spark.sql.connector.catalog.CatalogV2Implicits._
-  import org.apache.spark.sql.connector.catalog.CatalogV2Util._
-  import df.sparkSession.sessionState.analyzer.CatalogAndIdentifier
-
   private val df: DataFrame = ds.toDF()
 
   private val sparkSession = ds.sparkSession
 
-  private val catalogManager = sparkSession.sessionState.analyzer.catalogManager
-
   private val tableName = sparkSession.sessionState.sqlParser.parseMultipartIdentifier(table)
-
-  private val (catalog, identifier) = {
-    val CatalogAndIdentifier(catalog, identifier) = tableName
-    (catalog.asTableCatalog, identifier)
-  }
 
   private val logicalPlan = df.queryExecution.logical
 
@@ -120,19 +107,21 @@ final class DataFrameWriterV2[T] private[sql](table: String, ds: Dataset[T])
   }
 
   override def create(): Unit = {
-    // create and replace could alternatively create ParsedPlan statements, like
-    // `CreateTableFromDataFrameStatement(UnresolvedRelation(tableName), ...)`, to keep the catalog
-    // resolution logic in the analyzer.
     runCommand("create") {
-      CreateTableAsSelect(
-        catalog,
-        identifier,
-        partitioning.getOrElse(Seq.empty),
+      CreateTableAsSelectStatement(
+        tableName,
         logicalPlan,
-        properties = provider.map(p => properties + (TableCatalog.PROP_PROVIDER -> p))
-          .getOrElse(properties).toMap,
-        writeOptions = options.toMap,
-        ignoreIfExists = false)
+        partitioning.getOrElse(Seq.empty),
+        None,
+        properties.toMap,
+        provider,
+        Map.empty,
+        None,
+        None,
+        options.toMap,
+        None,
+        ifNotExists = false,
+        external = false)
     }
   }
 
@@ -156,13 +145,7 @@ final class DataFrameWriterV2[T] private[sql](table: String, ds: Dataset[T])
    */
   @throws(classOf[NoSuchTableException])
   def append(): Unit = {
-    val append = loadTable(catalog, identifier) match {
-      case Some(t) =>
-        AppendData.byName(DataSourceV2Relation.create(t), logicalPlan, options.toMap)
-      case _ =>
-        throw new NoSuchTableException(identifier)
-    }
-
+    val append = AppendData.byName(UnresolvedRelation(tableName), logicalPlan, options.toMap)
     runCommand("append")(append)
   }
 
@@ -178,14 +161,8 @@ final class DataFrameWriterV2[T] private[sql](table: String, ds: Dataset[T])
    */
   @throws(classOf[NoSuchTableException])
   def overwrite(condition: Column): Unit = {
-    val overwrite = loadTable(catalog, identifier) match {
-      case Some(t) =>
-        OverwriteByExpression.byName(
-          DataSourceV2Relation.create(t), logicalPlan, condition.expr, options.toMap)
-      case _ =>
-        throw new NoSuchTableException(identifier)
-    }
-
+    val overwrite = OverwriteByExpression.byName(
+      UnresolvedRelation(tableName), logicalPlan, condition.expr, options.toMap)
     runCommand("overwrite")(overwrite)
   }
 
@@ -204,14 +181,8 @@ final class DataFrameWriterV2[T] private[sql](table: String, ds: Dataset[T])
    */
   @throws(classOf[NoSuchTableException])
   def overwritePartitions(): Unit = {
-    val dynamicOverwrite = loadTable(catalog, identifier) match {
-      case Some(t) =>
-        OverwritePartitionsDynamic.byName(
-          DataSourceV2Relation.create(t), logicalPlan, options.toMap)
-      case _ =>
-        throw new NoSuchTableException(identifier)
-    }
-
+    val dynamicOverwrite = OverwritePartitionsDynamic.byName(
+      UnresolvedRelation(tableName), logicalPlan, options.toMap)
     runCommand("overwritePartitions")(dynamicOverwrite)
   }
 
@@ -222,18 +193,23 @@ final class DataFrameWriterV2[T] private[sql](table: String, ds: Dataset[T])
   private def runCommand(name: String)(command: LogicalPlan): Unit = {
     val qe = sparkSession.sessionState.executePlan(command)
     // call `QueryExecution.toRDD` to trigger the execution of commands.
-    SQLExecution.withNewExecutionId(sparkSession, qe, Some(name))(qe.toRdd)
+    SQLExecution.withNewExecutionId(qe, Some(name))(qe.toRdd)
   }
 
   private def internalReplace(orCreate: Boolean): Unit = {
     runCommand("replace") {
-      ReplaceTableAsSelect(
-        catalog,
-        identifier,
-        partitioning.getOrElse(Seq.empty),
+      ReplaceTableAsSelectStatement(
+        tableName,
         logicalPlan,
-        properties = provider.map(p => properties + ("provider" -> p)).getOrElse(properties).toMap,
-        writeOptions = options.toMap,
+        partitioning.getOrElse(Seq.empty),
+        None,
+        properties.toMap,
+        provider,
+        Map.empty,
+        None,
+        None,
+        options.toMap,
+        None,
         orCreate = orCreate)
     }
   }
@@ -242,6 +218,7 @@ final class DataFrameWriterV2[T] private[sql](table: String, ds: Dataset[T])
 /**
  * Configuration methods common to create/replace operations and insert/overwrite operations.
  * @tparam R builder type to return
+ * @since 3.0.0
  */
 trait WriteConfigMethods[R] {
   /**
@@ -289,6 +266,8 @@ trait WriteConfigMethods[R] {
 
 /**
  * Trait to restrict calls to create and replace operations.
+ *
+ * @since 3.0.0
  */
 trait CreateTableWriter[T] extends WriteConfigMethods[CreateTableWriter[T]] {
   /**
@@ -316,7 +295,7 @@ trait CreateTableWriter[T] extends WriteConfigMethods[CreateTableWriter[T]] {
    * [[org.apache.spark.sql.catalyst.analysis.CannotReplaceMissingTableException]].
    *
    * @throws org.apache.spark.sql.catalyst.analysis.CannotReplaceMissingTableException
-   *         If the table already exists
+   *         If the table does not exist
    */
   @throws(classOf[CannotReplaceMissingTableException])
   def replace(): Unit

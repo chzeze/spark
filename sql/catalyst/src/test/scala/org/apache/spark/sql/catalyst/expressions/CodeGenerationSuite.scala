@@ -19,6 +19,8 @@ package org.apache.spark.sql.catalyst.expressions
 
 import java.sql.Timestamp
 
+import scala.math.Ordering
+
 import org.apache.spark.SparkFunSuite
 import org.apache.spark.metrics.source.CodegenMetrics
 import org.apache.spark.sql.Row
@@ -28,7 +30,7 @@ import org.apache.spark.sql.catalyst.expressions.codegen._
 import org.apache.spark.sql.catalyst.expressions.codegen.Block._
 import org.apache.spark.sql.catalyst.expressions.objects._
 import org.apache.spark.sql.catalyst.util.{ArrayBasedMapData, DateTimeUtils}
-import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.catalyst.util.DateTimeTestUtils.LA
 import org.apache.spark.sql.types._
 import org.apache.spark.unsafe.types.UTF8String
 import org.apache.spark.util.ThreadUtils
@@ -102,7 +104,7 @@ class CodeGenerationSuite extends SparkFunSuite with ExpressionEvalHelper {
   test("SPARK-22543: split large if expressions into blocks due to JVM code size limit") {
     var strExpr: Expression = Literal("abc")
     for (_ <- 1 to 150) {
-      strExpr = Decode(Encode(strExpr, "utf-8"), "utf-8")
+      strExpr = StringDecode(Encode(strExpr, "utf-8"), "utf-8")
     }
 
     val expressions = Seq(If(EqualTo(strExpr, strExpr), strExpr, strExpr))
@@ -187,42 +189,36 @@ class CodeGenerationSuite extends SparkFunSuite with ExpressionEvalHelper {
   }
 
   test("SPARK-17702: split wide constructor into blocks due to JVM code size limit") {
-    withSQLConf(SQLConf.UTC_TIMESTAMP_FUNC_ENABLED.key -> "true") {
-      val length = 5000
-      val expressions = Seq.fill(length) {
-        ToUTCTimestamp(
-          Literal.create(Timestamp.valueOf("2015-07-24 00:00:00"), TimestampType),
-          Literal.create("PST", StringType))
-      }
-      val plan = GenerateMutableProjection.generate(expressions)
-      val actual = plan(new GenericInternalRow(length)).toSeq(expressions.map(_.dataType))
-      val expected = Seq.fill(length)(
-        DateTimeUtils.fromJavaTimestamp(Timestamp.valueOf("2015-07-24 07:00:00")))
+    val length = 5000
+    val expressions = Seq.fill(length) {
+      ToUTCTimestamp(
+        Literal.create(Timestamp.valueOf("2015-07-24 00:00:00"), TimestampType),
+        Literal.create(LA.getId, StringType))
+    }
+    val plan = GenerateMutableProjection.generate(expressions)
+    val actual = plan(new GenericInternalRow(length)).toSeq(expressions.map(_.dataType))
+    val expected = Seq.fill(length)(
+      DateTimeUtils.fromJavaTimestamp(Timestamp.valueOf("2015-07-24 07:00:00")))
 
-      if (actual != expected) {
-        fail(
-          s"Incorrect Evaluation: expressions: $expressions, actual: $actual, expected: $expected")
-      }
+    if (actual != expected) {
+      fail(s"Incorrect Evaluation: expressions: $expressions, actual: $actual, expected: $expected")
     }
   }
 
   test("SPARK-22226: group splitted expressions into one method per nested class") {
-    withSQLConf(SQLConf.UTC_TIMESTAMP_FUNC_ENABLED.key -> "true") {
-      val length = 10000
-      val expressions = Seq.fill(length) {
-        ToUTCTimestamp(
-          Literal.create(Timestamp.valueOf("2017-10-10 00:00:00"), TimestampType),
-          Literal.create("PST", StringType))
-      }
-      val plan = GenerateMutableProjection.generate(expressions)
-      val actual = plan(new GenericInternalRow(length)).toSeq(expressions.map(_.dataType))
-      val expected = Seq.fill(length)(
-        DateTimeUtils.fromJavaTimestamp(Timestamp.valueOf("2017-10-10 07:00:00")))
+    val length = 10000
+    val expressions = Seq.fill(length) {
+      ToUTCTimestamp(
+        Literal.create(Timestamp.valueOf("2017-10-10 00:00:00"), TimestampType),
+        Literal.create(LA.getId, StringType))
+    }
+    val plan = GenerateMutableProjection.generate(expressions)
+    val actual = plan(new GenericInternalRow(length)).toSeq(expressions.map(_.dataType))
+    val expected = Seq.fill(length)(
+      DateTimeUtils.fromJavaTimestamp(Timestamp.valueOf("2017-10-10 07:00:00")))
 
-      if (actual != expected) {
-        fail(
-          s"Incorrect Evaluation: expressions: $expressions, actual: $actual, expected: $expected")
-      }
+    if (actual != expected) {
+      fail(s"Incorrect Evaluation: expressions: $expressions, actual: $actual, expected: $expected")
     }
   }
 
@@ -336,7 +332,7 @@ class CodeGenerationSuite extends SparkFunSuite with ExpressionEvalHelper {
   }
 
   test("SPARK-17160: field names are properly escaped by AssertTrue") {
-    GenerateUnsafeProjection.generate(AssertTrue(Cast(Literal("\""), BooleanType)) :: Nil)
+    GenerateUnsafeProjection.generate(AssertTrue(Cast(Literal("\""), BooleanType)).child :: Nil)
   }
 
   test("should not apply common subexpression elimination on conditional expressions") {
@@ -519,7 +515,7 @@ class CodeGenerationSuite extends SparkFunSuite with ExpressionEvalHelper {
   }
 
   test("SPARK-25113: should log when there exists generated methods above HugeMethodLimit") {
-    val appender = new LogAppender
+    val appender = new LogAppender("huge method limit")
     withLogAppender(appender, loggerName = Some(classOf[CodeGenerator[_, _]].getName)) {
       val x = 42
       val expr = HugeCodeIntExpression(x)
@@ -531,7 +527,7 @@ class CodeGenerationSuite extends SparkFunSuite with ExpressionEvalHelper {
       .exists(_.getRenderedMessage().contains("Generated method too long")))
   }
 
-  test("SPARK-28916: subexrepssion elimination can cause 64kb code limit on UnsafeProjection") {
+  test("SPARK-28916: subexpression elimination can cause 64kb code limit on UnsafeProjection") {
     val numOfExprs = 10000
     val exprs = (0 to numOfExprs).flatMap(colIndex =>
       Seq(Add(BoundReference(colIndex, DoubleType, true),
@@ -541,6 +537,26 @@ class CodeGenerationSuite extends SparkFunSuite with ExpressionEvalHelper {
     // these should not fail to compile due to 64K limit
     GenerateUnsafeProjection.generate(exprs, true)
     GenerateMutableProjection.generate(exprs, true)
+  }
+
+  test("SPARK-32624: Use CodeGenerator.typeName() to fix byte[] compile issue") {
+    val ctx = new CodegenContext
+    val bytes = new Array[Byte](3)
+    val refTerm = ctx.addReferenceObj("bytes", bytes)
+    assert(refTerm == "((byte[]) references[0] /* bytes */)")
+  }
+
+  test("SPARK-32624: CodegenContext.addReferenceObj should work for nested Scala class") {
+    // emulate TypeUtils.getInterpretedOrdering(StringType)
+    val ctx = new CodegenContext
+    val comparator = implicitly[Ordering[UTF8String]]
+    val refTerm = ctx.addReferenceObj("comparator", comparator)
+
+    // Expecting result:
+    //   "((scala.math.LowPriorityOrderingImplicits$$anon$3) references[0] /* comparator */)"
+    // Using lenient assertions to be resilient to anonymous class numbering changes
+    assert(!refTerm.contains("null"))
+    assert(refTerm.contains("scala.math.LowPriorityOrderingImplicits$$anon$"))
   }
 }
 

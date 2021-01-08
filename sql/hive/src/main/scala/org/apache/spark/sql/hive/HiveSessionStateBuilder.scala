@@ -17,6 +17,8 @@
 
 package org.apache.spark.sql.hive
 
+import java.net.URI
+
 import org.apache.spark.annotation.Unstable
 import org.apache.spark.sql._
 import org.apache.spark.sql.catalyst.analysis.{Analyzer, ResolveSessionCatalog}
@@ -24,18 +26,24 @@ import org.apache.spark.sql.catalyst.catalog.ExternalCatalogWithListener
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.execution.SparkPlanner
+import org.apache.spark.sql.execution.aggregate.ResolveEncodersInScalaAgg
 import org.apache.spark.sql.execution.analysis.DetectAmbiguousSelfJoin
+import org.apache.spark.sql.execution.command.CommandCheck
 import org.apache.spark.sql.execution.datasources._
 import org.apache.spark.sql.execution.datasources.v2.TableCapabilityCheck
 import org.apache.spark.sql.hive.client.HiveClient
+import org.apache.spark.sql.hive.execution.PruneHiveTablePartitions
 import org.apache.spark.sql.internal.{BaseSessionStateBuilder, SessionResourceLoader, SessionState}
 
 /**
  * Builder that produces a Hive-aware `SessionState`.
  */
 @Unstable
-class HiveSessionStateBuilder(session: SparkSession, parentState: Option[SessionState] = None)
-  extends BaseSessionStateBuilder(session, parentState) {
+class HiveSessionStateBuilder(
+    session: SparkSession,
+    parentState: Option[SessionState],
+    options: Map[String, String])
+  extends BaseSessionStateBuilder(session, parentState, options) {
 
   private def externalCatalog: ExternalCatalogWithListener = session.sharedState.externalCatalog
 
@@ -56,7 +64,6 @@ class HiveSessionStateBuilder(session: SparkSession, parentState: Option[Session
       () => session.sharedState.globalTempViewManager,
       new HiveMetastoreCatalog(session),
       functionRegistry,
-      conf,
       SessionState.newHadoopConf(session.sparkContext.hadoopConfiguration, conf),
       sqlParser,
       resourceLoader)
@@ -67,22 +74,25 @@ class HiveSessionStateBuilder(session: SparkSession, parentState: Option[Session
   /**
    * A logical query plan `Analyzer` with rules specific to Hive.
    */
-  override protected def analyzer: Analyzer = new Analyzer(catalogManager, conf) {
+  override protected def analyzer: Analyzer = new Analyzer(catalogManager) {
     override val extendedResolutionRules: Seq[Rule[LogicalPlan]] =
       new ResolveHiveSerdeTable(session) +:
         new FindDataSourceTable(session) +:
         new ResolveSQLOnFile(session) +:
         new FallBackFileSourceV2(session) +:
-        new ResolveSessionCatalog(catalogManager, conf, catalog.isView) +:
+        ResolveEncodersInScalaAgg +:
+        new ResolveSessionCatalog(
+          catalogManager, catalog.isTempView, catalog.isTempFunction) +:
         customResolutionRules
 
     override val postHocResolutionRules: Seq[Rule[LogicalPlan]] =
-      new DetectAmbiguousSelfJoin(conf) +:
+      DetectAmbiguousSelfJoin +:
         new DetermineTableStats(session) +:
-        RelationConversions(conf, catalog) +:
+        RelationConversions(catalog) +:
         PreprocessTableCreation(session) +:
-        PreprocessTableInsertion(conf) +:
-        DataSourceAnalysis(conf) +:
+        PreprocessTableInsertion +:
+        DataSourceAnalysis +:
+        PaddingAndLengthCheckForCharVarchar +:
         HiveAnalysis +:
         customPostHocResolutionRules
 
@@ -90,22 +100,27 @@ class HiveSessionStateBuilder(session: SparkSession, parentState: Option[Session
       PreWriteCheck +:
         PreReadCheck +:
         TableCapabilityCheck +:
+        CommandCheck +:
         customCheckRules
   }
+
+  override def customEarlyScanPushDownRules: Seq[Rule[LogicalPlan]] =
+    Seq(new PruneHiveTablePartitions(session))
 
   /**
    * Planner that takes into account Hive-specific strategies.
    */
   override protected def planner: SparkPlanner = {
-    new SparkPlanner(session, conf, experimentalMethods) with HiveStrategies {
+    new SparkPlanner(session, experimentalMethods) with HiveStrategies {
       override val sparkSession: SparkSession = session
 
       override def extraPlanningStrategies: Seq[Strategy] =
-        super.extraPlanningStrategies ++ customPlanningStrategies ++ Seq(HiveTableScans, Scripts)
+        super.extraPlanningStrategies ++ customPlanningStrategies ++
+          Seq(HiveTableScans, HiveScripts)
     }
   }
 
-  override protected def newBuilder: NewBuilder = new HiveSessionStateBuilder(_, _)
+  override protected def newBuilder: NewBuilder = new HiveSessionStateBuilder(_, _, Map.empty)
 }
 
 class HiveSessionResourceLoader(
@@ -114,7 +129,10 @@ class HiveSessionResourceLoader(
   extends SessionResourceLoader(session) {
   private lazy val client = clientBuilder()
   override def addJar(path: String): Unit = {
-    client.addJar(path)
-    super.addJar(path)
+    val uri = URI.create(path)
+    resolveJars(uri).foreach { p =>
+      client.addJar(p)
+      super.addJar(p)
+    }
   }
 }

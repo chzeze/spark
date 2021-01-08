@@ -23,7 +23,7 @@ import org.apache.spark.sql.AnalysisException
 import org.apache.spark.sql.catalog.{Column, Database, Function, Table}
 import org.apache.spark.sql.catalyst.{FunctionIdentifier, ScalaReflection, TableIdentifier}
 import org.apache.spark.sql.catalyst.catalog._
-import org.apache.spark.sql.catalyst.expressions.{Expression, ExpressionInfo}
+import org.apache.spark.sql.catalyst.expressions.Expression
 import org.apache.spark.sql.catalyst.plans.logical.Range
 import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.sql.types.StructType
@@ -89,9 +89,9 @@ class CatalogSuite extends SharedSparkSession {
     val columns = dbName
       .map { db => spark.catalog.listColumns(db, tableName) }
       .getOrElse { spark.catalog.listColumns(tableName) }
-    assume(tableMetadata.schema.nonEmpty, "bad test")
-    assume(tableMetadata.partitionColumnNames.nonEmpty, "bad test")
-    assume(tableMetadata.bucketSpec.isDefined, "bad test")
+    assert(tableMetadata.schema.nonEmpty, "bad test")
+    assert(tableMetadata.partitionColumnNames.nonEmpty, "bad test")
+    assert(tableMetadata.bucketSpec.isDefined, "bad test")
     assert(columns.collect().map(_.name).toSet == tableMetadata.schema.map(_.name).toSet)
     val bucketColumnNames = tableMetadata.bucketSpec.map(_.bucketColumnNames).getOrElse(Nil).toSet
     columns.collect().foreach { col =>
@@ -470,16 +470,20 @@ class CatalogSuite extends SharedSparkSession {
   }
 
   test("createTable with 'path' in options") {
+    val description = "this is a test table"
+
     withTable("t") {
       withTempDir { dir =>
         spark.catalog.createTable(
           tableName = "t",
           source = "json",
           schema = new StructType().add("i", "int"),
+          description = description,
           options = Map("path" -> dir.getAbsolutePath))
         val table = spark.sessionState.catalog.getTableMetadata(TableIdentifier("t"))
         assert(table.tableType == CatalogTableType.EXTERNAL)
         assert(table.storage.locationUri.get == makeQualifiedPath(dir.getAbsolutePath))
+        assert(table.comment == Some(description))
 
         Seq((1)).toDF("i").write.insertInto("t")
         assert(dir.exists() && dir.listFiles().nonEmpty)

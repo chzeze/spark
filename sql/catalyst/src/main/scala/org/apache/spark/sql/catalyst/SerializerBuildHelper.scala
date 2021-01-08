@@ -74,6 +74,9 @@ object SerializerBuildHelper {
       returnNullable = false)
   }
 
+  def createSerializerForJavaEnum(inputObject: Expression): Expression =
+    createSerializerForString(Invoke(inputObject, "name", ObjectType(classOf[String])))
+
   def createSerializerForSqlTimestamp(inputObject: Expression): Expression = {
     StaticInvoke(
       DateTimeUtils.getClass,
@@ -187,8 +190,12 @@ object SerializerBuildHelper {
     val nonNullOutput = CreateNamedStruct(fields.flatMap { case(fieldName, fieldExpr) =>
       argumentsForFieldSerializer(fieldName, fieldExpr)
     })
-    val nullOutput = expressions.Literal.create(null, nonNullOutput.dataType)
-    expressions.If(IsNull(inputObject), nullOutput, nonNullOutput)
+    if (inputObject.nullable) {
+      val nullOutput = expressions.Literal.create(null, nonNullOutput.dataType)
+      expressions.If(IsNull(inputObject), nullOutput, nonNullOutput)
+    } else {
+      nonNullOutput
+    }
   }
 
   def createSerializerForUserDefinedType(
